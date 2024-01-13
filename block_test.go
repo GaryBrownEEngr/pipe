@@ -3,23 +3,25 @@ package pipe
 import (
 	"fmt"
 	"testing"
-	"time"
 )
 
 func TestSrcSine(t *testing.T) {
-	c := NewController(10, 1, time.Millisecond)
+	c := NewController(10, 1, 0.001)
 
-	dataChan := SrcCosine(c, 100, 0)
+	dataWire := SrcSine(c, 100, 0)
+	wireEnd := dataWire.NewWireEnd()
 
-	time.Sleep(time.Millisecond * 200)
-	close(c.done)
-
-	data := <-dataChan
+	c.Start()
+	data, _ := wireEnd.GetData()
+	c.Stop()
 	fmt.Println(data)
 
-	data = <-dataChan
+	data, _ = wireEnd.GetData()
 	fmt.Println(data)
 
-	data = <-dataChan
+	data, _ = wireEnd.GetData()
+	fmt.Println(data)
+
+	data, _ = wireEnd.GetData()
 	fmt.Println(data)
 }

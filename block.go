@@ -1,42 +1,79 @@
 package pipe
 
 import (
+	"fmt"
 	"math"
-	"time"
+	"math/cmplx"
 )
 
-type Controller struct {
-	blockSize    int
-	channelDepth int
-	timeStep     time.Duration
-	done         chan bool
+type RealNumber interface {
+	int | int8 | int16 | int32 | int64 | uint | uint8 | uint16 | uint32 | uint64 | float32 | float64
 }
 
-func NewController(blockSize, channelDepth int, timeStep time.Duration) *Controller {
-	ret := &Controller{
-		blockSize:    blockSize,
-		channelDepth: channelDepth,
-		timeStep:     timeStep,
-		done:         make(chan bool),
-	}
-
-	return ret
+type ComplexNumber interface {
+	complex64 | complex128
 }
 
-func SrcSine(c *Controller, frequencyHz float64, startPhaseRad float64) chan []float64 {
-	outChan := make(chan []float64, c.channelDepth)
+type Number interface {
+	RealNumber | ComplexNumber
+}
+
+func SrcComplexFrequency(c *Controller, frequencyHz float64, startPhaseRad float64) *Wire[complex128] {
+	outWire := NewWire[complex128](c.channelDepth)
 
 	go func() {
 		sin, cos := math.Sincos(startPhaseRad)
 		v := complex(cos, sin)
 
-		sin, cos = math.Sincos(frequencyHz * 2 * math.Pi * c.timeStep.Seconds())
+		sin, cos = math.Sincos(frequencyHz * 2 * math.Pi * c.timeStepSec)
 		twiddle := complex(cos, sin)
+
+		c.WaitForStart()
 
 	MainLoop:
 		for {
 			select {
-			case <-c.done:
+			case <-c.doneChan:
+				break MainLoop
+			default:
+				// nothing
+			}
+
+			buf := make([]complex128, c.blockSize)
+			for i := 0; i < c.blockSize; i++ {
+				buf[i] = v
+				v = v * twiddle
+			}
+
+			outWire.Publish(buf)
+
+			// Normalize the vector back to a length of 1.
+			mag := cmplx.Abs(v)
+			v = complex(real(v)/mag, imag(v)/mag)
+		}
+
+		outWire.Stop()
+	}()
+
+	return outWire.GetWire()
+}
+
+func SrcSine(c *Controller, frequencyHz float64, startPhaseRad float64) *Wire[float64] {
+	outWire := NewWire[float64](c.channelDepth)
+
+	go func() {
+		sin, cos := math.Sincos(startPhaseRad)
+		v := complex(cos, sin)
+
+		sin, cos = math.Sincos(frequencyHz * 2 * math.Pi * c.timeStepSec)
+		twiddle := complex(cos, sin)
+
+		c.WaitForStart()
+
+	MainLoop:
+		for {
+			select {
+			case <-c.doneChan:
 				break MainLoop
 			default:
 				// nothing
@@ -48,106 +85,155 @@ func SrcSine(c *Controller, frequencyHz float64, startPhaseRad float64) chan []f
 				v = v * twiddle
 			}
 
-			outChan <- buf
+			outWire.Publish(buf)
 
 			// Normalize the vector back to a length of 1.
 			mag := math.Sqrt(real(v)*real(v) + imag(v)*imag(v))
 			v = complex(real(v)/mag, imag(v)/mag)
 		}
 
-		close(outChan)
-
+		outWire.Stop()
 	}()
 
-	return outChan
+	return outWire.GetWire()
 }
 
-func SrcCosine(c *Controller, frequencyHz float64, startPhaseRad float64) chan []float64 {
+func SrcCosine(c *Controller, frequencyHz float64, startPhaseRad float64) *Wire[float64] {
 	return SrcSine(c, frequencyHz, startPhaseRad+math.Pi/2.0)
 }
 
-func Add(c *Controller, a, b chan []float64) chan []float64 {
-	outChan := make(chan []float64, c.channelDepth)
-
-	go func() {
-	MainLoop:
-		for {
-			select {
-			case <-c.done:
-				break MainLoop
-			default:
-				// nothing
-			}
-
-			aData := <-a
-			bData := <-b
-
-			if len(aData) != c.blockSize || len(bData) != c.blockSize {
-				panic("Bad block size")
-			}
-
-			buf := make([]float64, c.blockSize)
-			for i := 0; i < c.blockSize; i++ {
-				buf[i] = aData[i] + bData[i]
-			}
-
-			outChan <- buf
-		}
-
-		go drainChannelTillClosed(a)
-		drainChannelTillClosed(b)
-
-		close(outChan)
-
-	}()
-
-	return outChan
-}
-
-func drainChannelTillClosed[T any](in chan []T) {
-	for {
-		_, ok := <-in
-		if !ok {
-			return
-		}
+// y = x[0] + x[1] + x[2] + ...
+func Add[T Number](c *Controller, inputs ...*Wire[T]) *Wire[T] {
+	if len(inputs) < 2 {
+		panic("Need 2 or more inputs")
 	}
 
+	operation := func(inputs [][]T) []T {
+		// make the output block
+		out := make([]T, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			y := inputs[i][0]
+			for _, x := range inputs[i][1:] {
+				y += x
+			}
+			out[i] = y
+		}
+		return out
+	}
+
+	return GenericProcessingBlock_NIn_1Out(c, operation, inputs...)
 }
 
-func Multiply(c *Controller, a, b chan []float64) chan []float64 {
-	outChan := make(chan []float64, c.channelDepth)
+// y = x[0] - x[1] - x[2] - x[3] - ...
+func Subtract[T Number](c *Controller, inputs ...*Wire[T]) *Wire[T] {
+	if len(inputs) < 2 {
+		panic("Need 2 or more inputs")
+	}
 
-	go func() {
-	MainLoop:
-		for {
-			select {
-			case <-c.done:
-				break MainLoop
-			default:
-				// nothing
+	operation := func(inputs [][]T) []T {
+		// make the output block
+		out := make([]T, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			y := inputs[i][0]
+			for _, x := range inputs[i][1:] {
+				y -= x
 			}
-
-			aData := <-a
-			bData := <-b
-
-			if len(aData) != c.blockSize || len(bData) != c.blockSize {
-				panic("Bad block size")
-			}
-
-			buf := make([]float64, c.blockSize)
-			for i := 0; i < c.blockSize; i++ {
-				buf[i] = aData[i] * bData[i]
-			}
-
-			outChan <- buf
+			out[i] = y
 		}
+		return out
+	}
 
-		go drainChannelTillClosed(a)
-		drainChannelTillClosed(b)
+	return GenericProcessingBlock_NIn_1Out(c, operation, inputs...)
+}
 
-		close(outChan)
+// y = x[0] * x[1] * x[2] * ...
+func Multiply[T Number](c *Controller, inputs ...*Wire[T]) *Wire[T] {
+	operation := func(inputs [][]T) []T {
+		// make the output block
+		out := make([]T, c.blockSize)
 
-	}()
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			y := inputs[i][0]
+			for _, x := range inputs[i][1:] {
+				y *= x
+			}
+			out[i] = y
+		}
+		return out
+	}
 
-	return outChan
+	return GenericProcessingBlock_NIn_1Out(c, operation, inputs...)
+}
+
+// y = x[0] / x[1] / x[2] / ...
+func Divide[T Number](c *Controller, inputs ...*Wire[T]) *Wire[T] {
+	operation := func(inputs [][]T) []T {
+		// make the output block
+		out := make([]T, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			y := inputs[i][0]
+			for _, x := range inputs[i][1:] {
+				y /= x
+			}
+			out[i] = y
+		}
+		return out
+	}
+
+	return GenericProcessingBlock_NIn_1Out(c, operation, inputs...)
+}
+
+func RealToFloat64[T RealNumber](c *Controller, inWire *Wire[T]) *Wire[float64] {
+	operation := func(input []T) []float64 {
+		// make the output block
+		out := make([]float64, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			out[i] = float64(input[i])
+		}
+		return out
+	}
+
+	return GenericProcessingBlock_1In_1Out(c, operation, inWire)
+}
+
+func RealToComplex128[T RealNumber](c *Controller, inWire *Wire[T]) *Wire[complex128] {
+	operation := func(input []T) []complex128 {
+		// make the output block
+		out := make([]complex128, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			out[i] = complex(float64(input[i]), 0)
+		}
+		return out
+	}
+
+	return GenericProcessingBlock_1In_1Out(c, operation, inWire)
+}
+
+func Complex128ToFloat64(c *Controller, inWire *Wire[complex128]) *Wire[float64] {
+	operation := func(input []complex128) []float64 {
+		// make the output block
+		out := make([]float64, c.blockSize)
+
+		// Add the values
+		for i := 0; i < c.blockSize; i++ {
+			x := real(input[i])
+			fmt.Println(x)
+
+			// out[i] = real(input[i])
+		}
+		return out
+	}
+
+	return GenericProcessingBlock_1In_1Out(c, operation, inWire)
 }
